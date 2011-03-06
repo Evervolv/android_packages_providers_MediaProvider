@@ -202,13 +202,18 @@ public class MediaProvider extends ContentProvider {
         }
 
         /**
-         * Touch this particular database and garbage collect old databases.
+         * For devices that have removable storage, we support keeping multiple databases
+         * to allow users to switch between a number of cards.
+         * On such devices, touch this particular database and garbage collect old databases.
          * An LRU cache system is used to clean up databases for old external
          * storage volumes.
          */
         @Override
         public void onOpen(SQLiteDatabase db) {
             if (mInternal) return;  // The internal database is kept separately.
+
+            // this code is only needed on devices with removable storage
+            if (!Environment.isExternalStorageRemovable()) return;
 
             // touch the database file to show it is most recently used
             File file = new File(db.getPath());
@@ -298,16 +303,10 @@ public class MediaProvider extends ContentProvider {
         iFilter.addDataScheme("file");
         getContext().registerReceiver(mUnmountReceiver, iFilter);
 
-        /*
-         * Open external database if either external storage is mounted
-         * or /data/media folder exists.
-         */
+        // open external database if external storage is mounted
         String state = Environment.getExternalStorageState();
-        File mediaDir = new File(Environment.getDataDirectory() +
-                                 "/media");
         if (Environment.MEDIA_MOUNTED.equals(state) ||
-                Environment.MEDIA_MOUNTED_READ_ONLY.equals(state) ||
-                mediaDir.isDirectory()) {
+                Environment.MEDIA_MOUNTED_READ_ONLY.equals(state)) {
             attachVolume(EXTERNAL_VOLUME);
         }
 
@@ -412,6 +411,7 @@ public class MediaProvider extends ContentProvider {
             db.execSQL("DROP TABLE IF EXISTS audio_playlists");
             db.execSQL("DROP TABLE IF EXISTS audio_playlists_map");
             db.execSQL("DROP TRIGGER IF EXISTS audio_playlists_cleanup");
+            db.execSQL("DROP TRIGGER IF EXISTS album_cleanup");
             db.execSQL("DROP TRIGGER IF EXISTS albumart_cleanup1");
             db.execSQL("DROP TRIGGER IF EXISTS albumart_cleanup2");
             db.execSQL("DROP TABLE IF EXISTS video");
@@ -584,6 +584,13 @@ public class MediaProvider extends ContentProvider {
                                "DELETE FROM audio_playlists_map WHERE playlist_id = old._id;" +
                                "SELECT _DELETE_FILE(old._data);" +
                            "END");
+
+                // Cleans up album table entry when all tracks in the album have been deleted
+                db.execSQL("CREATE TRIGGER IF NOT EXISTS album_cleanup AFTER DELETE ON audio_meta " +
+                        "WHEN (SELECT count(*) FROM audio_meta WHERE album_id = old.album_id) = 0 " +
+                        "BEGIN " +
+                            "DELETE FROM albums WHERE album_id = old.album_id;" +
+                        "END");
 
                 // Cleans up album_art table entry when an album is deleted
                 db.execSQL("CREATE TRIGGER IF NOT EXISTS albumart_cleanup1 DELETE ON albums " +
@@ -975,6 +982,11 @@ public class MediaProvider extends ContentProvider {
             // collation keys
             db.execSQL("DELETE from albums");
             db.execSQL("DELETE from artists");
+            db.execSQL("UPDATE audio_meta SET date_modified=0;");
+        } else if (fromVersion < 93) {
+            // the album disambiguator hash changed, so rescan songs and force
+            // albums to be updated. Artists are unaffected.
+            db.execSQL("DELETE from albums");
             db.execSQL("UPDATE audio_meta SET date_modified=0;");
         }
         sanityCheck(db, fromVersion);
@@ -1860,7 +1872,10 @@ public class MediaProvider extends ContentProvider {
                 // TODO Remove this and actually store the album_artist in the
                 // database. For now this is here so the media scanner can start
                 // sending us the album_artist, even though it's not in the db yet.
+                String albumartist = values.getAsString(MediaStore.Audio.Media.ALBUM_ARTIST);
                 values.remove(MediaStore.Audio.Media.ALBUM_ARTIST);
+                String compilation = values.getAsString(MediaStore.Audio.Media.COMPILATION);
+                values.remove(MediaStore.Audio.Media.COMPILATION);
 
                 // Insert the artist into the artist table and remove it from
                 // the input values
@@ -1888,7 +1903,14 @@ public class MediaProvider extends ContentProvider {
                 long albumRowId;
                 HashMap<String, Long> albumCache = database.mAlbumCache;
                 synchronized(albumCache) {
-                    int albumhash = path.substring(0, path.lastIndexOf('/')).hashCode();
+                    int albumhash = 0;
+                    if (albumartist != null) {
+                        albumhash = albumartist.hashCode();
+                    } else if (compilation != null && compilation.equals("1")) {
+                        // nothing to do, hash already set
+                    } else {
+                        albumhash = path.substring(0, path.lastIndexOf('/')).hashCode();
+                    }
                     String cacheName = s + albumhash;
                     Long temp = albumCache.get(cacheName);
                     if (temp == null) {
@@ -2321,7 +2343,10 @@ public class MediaProvider extends ContentProvider {
                         // TODO Remove this and actually store the album_artist in the
                         // database. For now this is here so the media scanner can start
                         // sending us the album_artist, even though it's not in the db yet.
+                        String albumartist = values.getAsString(MediaStore.Audio.Media.ALBUM_ARTIST);
                         values.remove(MediaStore.Audio.Media.ALBUM_ARTIST);
+                        String compilation = values.getAsString(MediaStore.Audio.Media.COMPILATION);
+                        values.remove(MediaStore.Audio.Media.COMPILATION);
 
                         // Insert the artist into the artist table and remove it from
                         // the input values
@@ -2348,12 +2373,17 @@ public class MediaProvider extends ContentProvider {
                         if (so != null) {
                             String path = values.getAsString("_data");
                             int albumHash = 0;
-                            if (path == null) {
+                            if (albumartist != null) {
+                                albumHash = albumartist.hashCode();
+                            } else if (compilation != null && compilation.equals("1")) {
+                                // nothing to do, hash already set
+                            } else if (path == null) {
                                 // If the path is null, we don't have a hash for the file in question.
                                 Log.w(TAG, "Update without specified path.");
                             } else {
                                 albumHash = path.substring(0, path.lastIndexOf('/')).hashCode();
                             }
+
                             String s = so.toString();
                             long albumRowId;
                             HashMap<String, Long> albumCache = database.mAlbumCache;
@@ -2529,7 +2559,7 @@ public class MediaProvider extends ContentProvider {
                 // If that fails, try to get it from this specific file.
                 Uri newUri = ContentUris.withAppendedId(ALBUMART_URI, albumid);
                 try {
-                    pfd = openFile(newUri, mode);  // recursive call
+                    pfd = openFileHelper(newUri, mode);
                 } catch (FileNotFoundException ex) {
                     // That didn't work, now try to get it from the specific file
                     pfd = getThumb(db, audiopath, albumid, null);
@@ -2897,18 +2927,22 @@ public class MediaProvider extends ContentProvider {
         long rowId;
 
         if (rawName == null || rawName.length() == 0) {
-            return -1;
+            rawName = MediaStore.UNKNOWN_STRING;
         }
         String k = MediaStore.Audio.keyFor(rawName);
 
         if (k == null) {
+            // shouldn't happen, since we only get null keys for null inputs
+            Log.e(TAG, "null key", new Exception());
             return -1;
         }
 
         boolean isAlbum = table.equals("albums");
         boolean isUnknown = MediaStore.UNKNOWN_STRING.equals(rawName);
 
-        // To distinguish same-named albums, we append a hash of the path.
+        // To distinguish same-named albums, we append a hash. The hash is based
+        // on the "album artist" tag if present, otherwise on the "compilation" tag
+        // if present, otherwise on the path.
         // Ideally we would also take things like CDDB ID in to account, so
         // we can group files from the same album that aren't in the same
         // folder, but this is a quick and easy start that works immediately
@@ -3032,20 +3066,7 @@ public class MediaProvider extends ContentProvider {
     private DatabaseHelper getDatabaseForUri(Uri uri) {
         synchronized (mDatabases) {
             if (uri.getPathSegments().size() > 1) {
-                String dbKey = uri.getPathSegments().get(0);
-                /*
-                 * For external uri, if the sdcard is mounted,
-                 * the dbKey would be external-<fatVolumeId>.
-                 * Otherwise, the dbKey would be external-ffffff.
-                 * Information related to media files on /data/media
-                 * is stored in external-ffffff.db.
-                 */
-                if (dbKey.equals(EXTERNAL_VOLUME)) {
-                    String path = Environment.getExternalStorageDirectory().getPath();
-                    int volumeId = FileUtils.getFatVolumeId(path);
-                    dbKey = EXTERNAL_VOLUME + "-" + Integer.toHexString(volumeId);
-                }
-                return mDatabases.get(dbKey);
+                return mDatabases.get(uri.getPathSegments().get(0));
             }
         }
         return null;
@@ -3066,39 +3087,69 @@ public class MediaProvider extends ContentProvider {
         }
 
         synchronized (mDatabases) {
-            String dbKey = volume;
-
-            /*
-             * For internal volume, dbKey would be volume name.
-             * For external volumes (sdcard), dbKey would be
-             * external-<fat-vol-id>. For /data/media, dbKey would
-             * be external-ffffffff.
-             */
-            if (EXTERNAL_VOLUME.equals(volume)) {
-                String path = Environment.getExternalStorageDirectory().getPath();
-                int volumeID = FileUtils.getFatVolumeId(path);
-                if (LOCAL_LOGV) Log.v(TAG, path + " volume ID: " + volumeID);
-
-                // generate database name based on volume ID
-                dbKey = EXTERNAL_VOLUME + "-" + Integer.toHexString(volumeID);
-                mVolumeId = volumeID;
-            }
-
-            if (mDatabases.get(dbKey) != null) {  // Already attached
+            if (mDatabases.get(volume) != null) {  // Already attached
                 return Uri.parse("content://media/" + volume);
             }
 
+            Context context = getContext();
             DatabaseHelper db;
             if (INTERNAL_VOLUME.equals(volume)) {
-                db = new DatabaseHelper(getContext(), INTERNAL_DATABASE_NAME, true);
+                db = new DatabaseHelper(context, INTERNAL_DATABASE_NAME, true);
             } else if (EXTERNAL_VOLUME.equals(volume)) {
-                db = new DatabaseHelper(getContext(), dbKey + ".db" , false);
+                if (Environment.isExternalStorageRemovable()) {
+                    String path = Environment.getExternalStorageDirectory().getPath();
+                    int volumeID = FileUtils.getFatVolumeId(path);
+                    if (LOCAL_LOGV) Log.v(TAG, path + " volume ID: " + volumeID);
+
+                    // generate database name based on volume ID
+                    String dbName = "external-" + Integer.toHexString(volumeID) + ".db";
+                    db = new DatabaseHelper(context, dbName, false);
+                    mVolumeId = volumeID;
+                } else {
+                    // external database name should be EXTERNAL_DATABASE_NAME
+                    // however earlier releases used the external-XXXXXXXX.db naming
+                    // for devices without removable storage, and in that case we need to convert
+                    // to this new convention
+                    File dbFile = context.getDatabasePath(EXTERNAL_DATABASE_NAME);
+                    if (!dbFile.exists()) {
+                        // find the most recent external database and rename it to
+                        // EXTERNAL_DATABASE_NAME, and delete any other older
+                        // external database files
+                        File recentDbFile = null;
+                        for (String database : context.databaseList()) {
+                            if (database.startsWith("external-")) {
+                                File file = context.getDatabasePath(database);
+                                if (recentDbFile == null) {
+                                    recentDbFile = file;
+                                } else if (file.lastModified() > recentDbFile.lastModified()) {
+                                    recentDbFile.delete();
+                                    recentDbFile = file;
+                                } else {
+                                    file.delete();
+                                }
+                            }
+                        }
+                        if (recentDbFile != null) {
+                            if (recentDbFile.renameTo(dbFile)) {
+                                Log.d(TAG, "renamed database " + recentDbFile.getName() +
+                                        " to " + EXTERNAL_DATABASE_NAME);
+                            } else {
+                                Log.e(TAG, "Failed to rename database " + recentDbFile.getName() +
+                                        " to " + EXTERNAL_DATABASE_NAME);
+                                // This shouldn't happen, but if it does, continue using
+                                // the file under its old name
+                                dbFile = recentDbFile;
+                            }
+                        }
+                        // else DatabaseHelper will create one named EXTERNAL_DATABASE_NAME
+                    }
+                    db = new DatabaseHelper(context, dbFile.getName(), false);
+                }
             } else {
                 throw new IllegalArgumentException("There is no volume named " + volume);
             }
 
-            // dbKey is the key for the database handle
-            mDatabases.put(dbKey, db);
+            mDatabases.put(volume, db);
 
             if (!db.mInternal) {
                 // clean up stray album art files: delete every file not in the database
@@ -3147,28 +3198,16 @@ public class MediaProvider extends ContentProvider {
         }
 
         String volume = uri.getPathSegments().get(0);
-        String dbKey = volume;
-
         if (INTERNAL_VOLUME.equals(volume)) {
             throw new UnsupportedOperationException(
                     "Deleting the internal volume is not allowed");
-        } else if (EXTERNAL_VOLUME.equals(volume)) {
-            /*
-             * Database key for external volume is based on the volume name and
-             * volume id. For /data/media, the volume id returned by
-             * getFatVolumeId would be -1 and hence the dbKey external-ffffffff.
-             * For sdcard, dbKey would be external-<fat volume id>.
-             */
-            String path = Environment.getExternalStorageDirectory().getPath();
-            int volumeId = FileUtils.getFatVolumeId(path);
-            dbKey = EXTERNAL_VOLUME + "-" + Integer.toHexString(volumeId);
-        } else {
+        } else if (!EXTERNAL_VOLUME.equals(volume)) {
             throw new IllegalArgumentException(
                     "There is no volume named " + volume);
         }
 
         synchronized (mDatabases) {
-            DatabaseHelper database = mDatabases.get(dbKey);
+            DatabaseHelper database = mDatabases.get(volume);
             if (database == null) return;
 
             try {
@@ -3179,7 +3218,7 @@ public class MediaProvider extends ContentProvider {
                 Log.e(TAG, "Can't touch database file", e);
             }
 
-            mDatabases.remove(dbKey);
+            mDatabases.remove(volume);
             database.close();
         }
 
@@ -3189,8 +3228,9 @@ public class MediaProvider extends ContentProvider {
 
     private static String TAG = "MediaProvider";
     private static final boolean LOCAL_LOGV = true;
-    private static final int DATABASE_VERSION = 92;
+    private static final int DATABASE_VERSION = 93;
     private static final String INTERNAL_DATABASE_NAME = "internal.db";
+    private static final String EXTERNAL_DATABASE_NAME = "external.db";
 
     // maximum number of cached external databases to keep
     private static final int MAX_EXTERNAL_DATABASES = 3;
@@ -3207,7 +3247,7 @@ public class MediaProvider extends ContentProvider {
     private String mMediaScannerVolume;
 
     // current FAT volume ID
-    private int mVolumeId;
+    private int mVolumeId = -1;
 
     static final String INTERNAL_VOLUME = "internal";
     static final String EXTERNAL_VOLUME = "external";
