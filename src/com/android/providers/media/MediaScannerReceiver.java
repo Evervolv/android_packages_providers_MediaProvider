@@ -38,28 +38,26 @@ public class MediaScannerReceiver extends BroadcastReceiver
         Uri uri = intent.getData();
         if (action.equals(Intent.ACTION_BOOT_COMPLETED)) {
             // scan internal storage
-            scan(context, MediaProvider.INTERNAL_VOLUME);
+            scan(context, MediaProvider.INTERNAL_VOLUME, null);
         } else {
             if (uri.getScheme().equals("file")) {
                 // handle intents related to external storage
                 String path = uri.getPath();
-                String externalStoragePath = Environment.getExternalStorageDirectory().getPath();
-
                 Log.d(TAG, "action: " + action + " path: " + path);
                 if (action.equals(Intent.ACTION_MEDIA_MOUNTED)) {
                     // scan whenever any volume is mounted
-                    scan(context, MediaProvider.EXTERNAL_VOLUME);
-                } else if (action.equals(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE) &&
-                        path != null && path.startsWith(externalStoragePath + "/")) {
+                    scan(context, MediaProvider.EXTERNAL_VOLUME, path);
+                } else if (action.equals(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE)) {
                     scanFile(context, path);
                 }
             }
         }
     }
 
-    private void scan(Context context, String volume) {
+    private void scan(Context context, String volume, String path) {
         Bundle args = new Bundle();
         args.putString("volume", volume);
+        args.putString("path", path);
         context.startService(
                 new Intent(context, MediaScannerService.class).putExtras(args));
     }    
