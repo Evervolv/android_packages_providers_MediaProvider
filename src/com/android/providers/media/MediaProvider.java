@@ -67,6 +67,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.os.SystemProperties;
 import android.os.storage.StorageManager;
 import android.os.storage.StorageVolume;
 import android.preference.PreferenceManager;
@@ -246,7 +247,7 @@ public class MediaProvider extends ContentProvider {
                     synchronized (mDatabases) {
                         // Don't delete entries if the eject is due to a shutdown
                         if (!"".equals(SystemProperties.get("sys.shutdown.requested"))) {
-                            Log.d(TAG, "not deleting entries on eject due to shtudown");
+                            Log.d(TAG, "not deleting entries on eject due to shutdown");
                             return;
                         }
 
