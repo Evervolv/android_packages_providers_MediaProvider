@@ -5244,18 +5244,8 @@ public class MediaProvider extends ContentProvider {
             } else if (EXTERNAL_VOLUME.equals(volume)) {
                 if (Environment.isExternalStorageRemovable()) {
                     String path = mExternalStoragePaths[0];
-
-                    // For Kitkat we know this will fail but check anyway.
                     int volumeID = FileUtils.getFatVolumeId(path);
-                    //if (LOCAL_LOGV)
-                        Log.d(TAG, path + " volume ID: " + volumeID);
-
-                    if (volumeID == -1) {
-                        // HACK: build the real mount point (NOTE: /mnt/media_rw must be 770)
-                        String realPath = "/mnt/media_rw/" + path.substring(path.lastIndexOf('/')+1);
-                        volumeID = FileUtils.getFatVolumeId(realPath);
-                        Log.d(TAG, realPath + " volume ID: " + volumeID);
-                    }
+                    if (LOCAL_LOGV) Log.v(TAG, path + " volume ID: " + volumeID);
 
                     // Must check for failure!
                     // If the volume is not (yet) mounted, this will create a new
