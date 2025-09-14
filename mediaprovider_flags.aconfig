@@ -309,3 +309,12 @@ flag {
     is_fixed_read_only: true
     is_exported: true
 }
+
+flag {
+    name: "enable_path_sanitization"
+    is_exported: false
+    namespace: "mediaprovider"
+    description: "This flag enables file path sanitization before regex checks"
+    is_fixed_read_only: true
+    bug: "377888957"
+}
